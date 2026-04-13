@@ -1,0 +1,100 @@
+/* x-tweet-export: Export button and progress styles */
+
+#x-tweet-export-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  border: 1px solid rgb(47, 51, 54);
+  border-radius: 16px;
+  background: rgb(22, 24, 28);
+}
+
+.x-tweet-export-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.x-tweet-export-select {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgb(83, 100, 113);
+  border-radius: 9999px;
+  background: transparent;
+  color: rgb(231, 233, 234);
+  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  cursor: pointer;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+}
+
+.x-tweet-export-select:hover {
+  border-color: rgb(139, 152, 165);
+}
+
+.x-tweet-export-select option {
+  background: rgb(21, 32, 43);
+  color: rgb(231, 233, 234);
+}
+
+.x-tweet-export-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 34px;
+  padding: 0 16px;
+  border: 1px solid rgb(83, 100, 113);
+  border-radius: 9999px;
+  background: transparent;
+  color: rgb(231, 233, 234);
+  font-size: 14px;
+  font-weight: 700;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  cursor: pointer;
+  transition: background-color 0.2s, border-color 0.2s;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.x-tweet-export-button:hover:not(:disabled) {
+  background: rgba(231, 233, 234, 0.1);
+  border-color: rgb(139, 152, 165);
+}
+
+.x-tweet-export-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.x-tweet-export-icon {
+  font-size: 15px;
+}
+
+.x-tweet-export-label {
+  font-size: 13px;
+}
+
+/* Progress state */
+.x-tweet-export-button.x-tweet-export-progress {
+  border-color: rgb(29, 155, 240);
+  color: rgb(29, 155, 240);
+}
+
+/* Done state */
+.x-tweet-export-button.x-tweet-export-done {
+  border-color: rgb(0, 186, 124);
+  color: rgb(0, 186, 124);
+}
+
+/* Error state */
+.x-tweet-export-button.x-tweet-export-error {
+  border-color: rgb(244, 33, 46);
+  color: rgb(244, 33, 46);
+}
