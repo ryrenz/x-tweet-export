@@ -4,7 +4,8 @@
   "version": "1.0.0",
   "description": "Export any X (Twitter) user's tweets to CSV/JSON with one click.",
   "permissions": [
-    "downloads"
+    "downloads",
+    "storage"
   ],
   "host_permissions": [
     "*://x.com/*",

@@ -15,17 +15,27 @@
       case 'EXPORT_DOWNLOAD':
         // Forward download request to background service worker
         // Blob URLs created in MAIN world are accessible to the extension context
-        chrome.runtime.sendMessage({
-          type: 'DOWNLOAD_FILE',
-          url: payload.url,
-          filename: payload.filename,
-        }, (response) => {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'DOWNLOAD_FILE',
+            url: payload.url,
+            filename: payload.filename,
+          }, (response) => {
+            window.postMessage({
+              source: 'x-tweet-export-bridge',
+              type: 'DOWNLOAD_RESULT',
+              payload: response || { success: false, error: 'No response from background' },
+            }, '*');
+          });
+        } catch (e) {
+          // chrome.runtime.sendMessage throws synchronously when the extension
+          // context is invalidated (e.g. extension reloaded mid-session)
           window.postMessage({
             source: 'x-tweet-export-bridge',
             type: 'DOWNLOAD_RESULT',
-            payload: response || { success: false, error: 'No response from background' },
+            payload: { success: false, error: 'EXTENSION_INVALIDATED' },
           }, '*');
-        });
+        }
         break;
 
       case 'TRIGGER_EXPORT_FROM_UI':
@@ -36,6 +46,36 @@
           payload: payload,
         }, '*');
         break;
+
+      case 'STORAGE_REQUEST': {
+        // Forward chrome.storage.local op to background and relay result back
+        const { id, op, key, value } = payload || {};
+        try {
+          chrome.runtime.sendMessage({
+            type: 'STORAGE_OP',
+            op,
+            key,
+            value,
+          }, (response) => {
+            window.postMessage({
+              source: 'x-tweet-export-bridge',
+              type: 'STORAGE_RESULT',
+              payload: {
+                id,
+                value: response && response.success ? response.value : null,
+                error: response && response.success ? null : (response && response.error) || 'STORAGE_FAILED',
+              },
+            }, '*');
+          });
+        } catch (e) {
+          window.postMessage({
+            source: 'x-tweet-export-bridge',
+            type: 'STORAGE_RESULT',
+            payload: { id, value: null, error: 'EXTENSION_INVALIDATED' },
+          }, '*');
+        }
+        break;
+      }
 
       case 'AUTH_STATE_UPDATE':
         // Could store auth state in chrome.storage if needed later

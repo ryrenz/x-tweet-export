@@ -24,7 +24,23 @@
     },
     // Export state
     exporting: false,
+    pauseRequested: false,
   };
+
+  // Cancellable sleep — checks state.pauseRequested while waiting so a long
+  // 429 backoff (up to ~240s) can be aborted within ~200ms of the user clicking Stop.
+  function sleepCancellable(ms) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const tick = () => {
+        if (state.pauseRequested) return resolve();
+        const elapsed = Date.now() - start;
+        if (elapsed >= ms) return resolve();
+        setTimeout(tick, Math.min(200, ms - elapsed));
+      };
+      tick();
+    });
+  }
 
   // =========================================================================
   // Message helpers (MAIN world → ISOLATED world bridge)
@@ -286,9 +302,8 @@
 
     const queryId = state.queryIdMap['UserByScreenName'];
     if (!queryId) return;
-    // Only make active request if we have the real features for this endpoint
-    const features = state.featuresMap['UserByScreenName'];
-    if (!features) return;
+    // Prefer captured features from a live request; fall back to defaults for this endpoint
+    const features = state.featuresMap['UserByScreenName'] || DEFAULT_USER_FEATURES;
 
     const variables = JSON.stringify({
       screen_name: screenName,
@@ -390,19 +405,160 @@
     "withArticlePlainText": false
   });
 
+  // UserByScreenName endpoint has a different features contract
+  const DEFAULT_USER_FEATURES = JSON.stringify({
+    "hidden_profile_likes_enabled": true,
+    "hidden_profile_subscriptions_enabled": true,
+    "responsive_web_graphql_exclude_directive_enabled": true,
+    "verified_phone_label_enabled": false,
+    "subscriptions_verification_info_is_identity_verified_enabled": true,
+    "subscriptions_verification_info_verified_since_enabled": true,
+    "highlights_tweets_tab_ui_enabled": true,
+    "responsive_web_twitter_article_notes_tab_enabled": true,
+    "creator_subscriptions_tweet_preview_api_enabled": true,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": false,
+    "responsive_web_graphql_timeline_navigation_enabled": true
+  });
+
   // =========================================================================
-  // UserTweets fetching with cursor pagination
+  // UserTweets fetching with cursor pagination + adaptive rate limiting
   // =========================================================================
-  const FETCH_DELAY_MS = 3000;
   const TWEETS_PER_PAGE = 20;
   const DEFAULT_MAX_TWEETS = 100;
-  const HARD_MAX_TWEETS = 200;  // absolute ceiling, never exceed
-  const RATE_LIMIT_PAUSE_MS = 60000; // wait 60s on 429
-  const MAX_RATE_LIMIT_RETRIES = 2;  // max 429 retries per export
+  // Our safety cap for rate-limit exposure. X's own historical ceiling is ~3200 tweets
+  // (cursor returns empty after that), so 3000 leaves a small buffer below the real wall.
+  // At this size a single run is almost guaranteed to hit 429 once or twice — recovery
+  // relies on progress persistence + resume to finish across multiple sessions.
+  const HARD_MAX_TWEETS = 3000;
 
-  async function fetchAllTweets(userId, onProgress, maxTweets) {
+  // Adaptive delay bounds (ms). Actual delay derived from x-rate-limit-remaining ratio:
+  //   < 20% → MAX, > 50% → MIN, otherwise → MID. Falls back to MID when headers absent.
+  const MIN_FETCH_DELAY_MS = 2000;
+  const MID_FETCH_DELAY_MS = 4000;
+  const MAX_FETCH_DELAY_MS = 8000;
+
+  // Exponential backoff schedule for 429 (with ±20% jitter)
+  const RATE_LIMIT_BACKOFF_MS = [30000, 60000, 120000, 240000];
+  const MAX_RATE_LIMIT_RETRIES = RATE_LIMIT_BACKOFF_MS.length;
+
+  // Progress persistence — saved per userId, expires after 30 min
+  const PROGRESS_RESUME_TTL_MS = 30 * 60 * 1000;
+  const PROGRESS_KEY_PREFIX = 'progress:';
+
+  function computeAdaptiveDelay(remaining, limit) {
+    if (!remaining || !limit || limit <= 0) return MID_FETCH_DELAY_MS;
+    const ratio = remaining / limit;
+    if (ratio < 0.2) return MAX_FETCH_DELAY_MS;
+    if (ratio > 0.5) return MIN_FETCH_DELAY_MS;
+    return MID_FETCH_DELAY_MS;
+  }
+
+  function computeBackoffDelay(retryIdx) {
+    const base = RATE_LIMIT_BACKOFF_MS[Math.min(retryIdx, RATE_LIMIT_BACKOFF_MS.length - 1)];
+    const jitter = Math.floor(Math.random() * (base * 0.2));
+    return base + jitter;
+  }
+
+  // =========================================================================
+  // Storage bridge — chrome.storage.local lives in the isolated world,
+  // so we relay through bridge.js with a request/response message id pairing.
+  // Random ids prevent a co-resident page script from spoofing replies by
+  // guessing a sequential counter.
+  // =========================================================================
+  const storagePending = new Map();
+
+  function newMsgId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  }
+
+  function callStorage(op, key, value) {
+    return new Promise((resolve, reject) => {
+      const id = newMsgId();
+      const timer = setTimeout(() => {
+        if (storagePending.has(id)) {
+          storagePending.delete(id);
+          reject(new Error('STORAGE_TIMEOUT'));
+        }
+      }, 15000);
+      storagePending.set(id, { resolve, reject, timer });
+      sendToBridge('STORAGE_REQUEST', { id, op, key, value });
+    });
+  }
+
+  const storageGet = (key) => callStorage('get', key, null);
+  const storageSet = (key, value) => callStorage('set', key, value);
+  const storageDelete = (key) => callStorage('delete', key, null);
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (!event.data || event.data.source !== 'x-tweet-export-bridge') return;
+    if (event.data.type !== 'STORAGE_RESULT') return;
+    const { id, value, error } = event.data.payload || {};
+    const pending = storagePending.get(id);
+    if (!pending) return;
+    storagePending.delete(id);
+    clearTimeout(pending.timer);
+    if (error) pending.reject(new Error(error));
+    else pending.resolve(value);
+  });
+
+  // Validate a stored snapshot's shape before trusting it on resume.
+  // A malformed entry (manual storage write, schema drift, etc.) returns null
+  // so we fall through to a fresh export instead of crashing fetchAllTweets.
+  function isValidProgressSnapshot(data) {
+    if (!data || typeof data !== 'object') return false;
+    if (typeof data.timestamp !== 'number') return false;
+    if (!Array.isArray(data.tweets)) return false;
+    if (!Array.isArray(data.seenTweetIds)) return false;
+    if (!Array.isArray(data.seenCursors)) return false;
+    if (data.cursor != null && typeof data.cursor !== 'string') return false;
+    if (data.minViews != null && typeof data.minViews !== 'number') return false;
+    return true;
+  }
+
+  async function loadProgress(userId) {
+    try {
+      const data = await storageGet(PROGRESS_KEY_PREFIX + userId);
+      if (!isValidProgressSnapshot(data)) {
+        if (data) {
+          // Drop malformed entry so it doesn't keep failing validation
+          storageDelete(PROGRESS_KEY_PREFIX + userId).catch(() => {});
+        }
+        return null;
+      }
+      if (Date.now() - data.timestamp > PROGRESS_RESUME_TTL_MS) {
+        storageDelete(PROGRESS_KEY_PREFIX + userId).catch(() => {});
+        return null;
+      }
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Fire-and-forget — chrome.storage.local serializes writes internally, so
+  // back-to-back saves (one per page) are safe to enqueue without awaiting.
+  // Awaiting here would stall the pagination critical path by an extra
+  // postMessage round-trip + write latency on every page.
+  function saveProgress(userId, snapshot) {
+    storageSet(PROGRESS_KEY_PREFIX + userId, snapshot).catch(() => {});
+  }
+
+  function clearProgress(userId) {
+    return storageDelete(PROGRESS_KEY_PREFIX + userId).catch(() => {});
+  }
+
+  async function fetchAllTweets(userId, onProgress, maxTweets, options) {
+    options = options || {};
     var limit = Math.min(maxTweets || DEFAULT_MAX_TWEETS, HARD_MAX_TWEETS);
+    var minViews = options.minViews && options.minViews > 0 ? options.minViews : 0;
     var rateLimitRetries = 0;
+    var giveUpFromRateLimit = false;
+    var timelineExhausted = false;
+    var userPaused = false;
     if (!isAuthReady()) {
       throw new Error('AUTH_NOT_READY');
     }
@@ -411,13 +567,44 @@
     }
 
     const queryId = state.queryIdMap['UserTweets'];
-    const allTweets = [];
-    const seenCursors = new Set();
-    const seenTweetIds = new Set();
-    let cursor = null;
+    // Resume snapshots may have been collected under a different (or no) views filter.
+    // Re-apply the current minViews to keep the final output consistent with what the
+    // user selected this run, instead of leaking stale low-views tweets from earlier runs.
+    const rawResume = Array.isArray(options.resumeTweets) ? options.resumeTweets : [];
+    const allTweets = minViews > 0
+      ? rawResume.filter((t) => (t && t.views ? t.views : 0) >= minViews).slice()
+      : rawResume.slice();
+    const seenCursors = new Set(Array.isArray(options.resumeSeenCursors) ? options.resumeSeenCursors : []);
+    // Fall back to deriving ids from resumeTweets when the snapshot's id list is missing OR empty
+    // (an empty array would otherwise short-circuit the `||` and break dedup on resume).
+    const resumeIds = Array.isArray(options.resumeSeenTweetIds) && options.resumeSeenTweetIds.length > 0
+      ? options.resumeSeenTweetIds
+      : allTweets.map((t) => t.id);
+    const seenTweetIds = new Set(resumeIds);
+    let cursor = options.resumeCursor || null;
+    // Seed the resume cursor into seenCursors so that if X echoes it back as the
+    // next-page pointer (timeline-ceiling case), we break on the very first page
+    // instead of wasting a second request to detect the loop.
+    if (cursor) seenCursors.add(cursor);
     let pageCount = 0;
+    let nextDelay = MID_FETCH_DELAY_MS;
+    let lastRlInfo = '';
 
     while (true) {
+      // User-requested abort — bail out before issuing the next request, return
+      // whatever was collected so far. Caller treats this like a partial result
+      // (snapshot kept so the user can resume later).
+      // Note: a request already in flight when the user clicks Stop will still be
+      // awaited, parsed, and saved — we abort before issuing the *next* request,
+      // not the current one. This means the user gets up to one extra page (~20
+      // tweets) after clicking Stop. Deliberate: discarding an already-paid-for
+      // page would waste a GraphQL request that already counted against the
+      // rate-limit window.
+      if (state.pauseRequested) {
+        userPaused = true;
+        break;
+      }
+
       const variables = {
         userId: userId,
         count: TWEETS_PER_PAGE,
@@ -458,22 +645,31 @@
         throw new Error('AUTH_EXPIRED');
       }
       if (response.status === 429) {
-        rateLimitRetries++;
-        if (rateLimitRetries > MAX_RATE_LIMIT_RETRIES) {
-          // Already retried enough — save what we have
+        if (rateLimitRetries >= MAX_RATE_LIMIT_RETRIES) {
+          giveUpFromRateLimit = true;
           if (allTweets.length > 0) break;
           throw new Error('RATE_LIMITED');
         }
-        // Pause and retry this page
+        const wait = computeBackoffDelay(rateLimitRetries);
+        rateLimitRetries++;
         if (onProgress) {
-          onProgress(allTweets.length, pageCount, 'Rate limited, waiting 60s...');
+          onProgress(allTweets.length, pageCount, 'Rate limited, waiting ' + Math.round(wait / 1000) + 's (retry ' + rateLimitRetries + '/' + MAX_RATE_LIMIT_RETRIES + ')...');
         }
-        await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_PAUSE_MS));
+        await sleepCancellable(wait);
         continue;
       }
       if (!response.ok) {
         throw new Error('HTTP_' + response.status);
       }
+
+      // Read rate-limit headers for next adaptive delay
+      const rlRemaining = parseInt(response.headers.get('x-rate-limit-remaining') || '0', 10);
+      const rlLimit = parseInt(response.headers.get('x-rate-limit-limit') || '0', 10);
+      nextDelay = computeAdaptiveDelay(rlRemaining, rlLimit);
+      lastRlInfo = rlLimit ? (' [' + rlRemaining + '/' + rlLimit + ']') : '';
+
+      // Reset retry counter on a successful page
+      rateLimitRetries = 0;
 
       let json;
       try {
@@ -484,34 +680,69 @@
 
       const { tweets, nextCursor } = parseTweetsFromResponse(json);
 
-      let newCount = 0;
+      let newCount = 0;       // newly-matched tweets pushed to allTweets this page
+      let newScanned = 0;     // newly-seen tweets this page (pre-filter), for scan-depth metric
       for (const tweet of tweets) {
         if (!seenTweetIds.has(tweet.id)) {
           seenTweetIds.add(tweet.id);
-          allTweets.push(tweet);
-          newCount++;
+          newScanned++;
+          // Apply min-views filter — non-matching tweets are dedup-tracked but not collected
+          if (minViews === 0 || (tweet.views || 0) >= minViews) {
+            allTweets.push(tweet);
+            newCount++;
+          }
         }
       }
 
       pageCount++;
       if (onProgress) {
-        onProgress(allTweets.length, pageCount);
+        onProgress(allTweets.length, pageCount, null, lastRlInfo, seenTweetIds.size);
       }
 
-      if (!nextCursor) break;
-      if (seenCursors.has(nextCursor)) break;
-      if (newCount === 0 && pageCount > 1) break;
-      if (limit > 0 && allTweets.length >= limit) break;
+      // Terminal-condition signals:
+      //   - !nextCursor or cursor cycle → X has no more pages
+      //   - newScanned === 0 on a non-first page → loop / dead-end (use scanned not collected,
+      //     otherwise filtering would falsely trip this when no matches happen on a page)
+      //   - allTweets.length >= limit → quota filled
+      const cursorExhausted = !nextCursor || seenCursors.has(nextCursor);
+      const noProgress = newScanned === 0 && pageCount > 1;
+      const quotaFilled = limit > 0 && allTweets.length >= limit;
+      if (cursorExhausted || noProgress) {
+        timelineExhausted = !quotaFilled; // only mark exhausted if we stopped short of quota
+      }
+      const willStop = cursorExhausted || noProgress || quotaFilled;
+
+      // Persist progress only when there's actually more work to resume.
+      // Fire-and-forget: storage writes serialize internally; awaiting here
+      // would stall pagination by a postMessage RTT + write latency per page.
+      if (!willStop && typeof options.onPageDone === 'function') {
+        options.onPageDone({
+          tweets: allTweets,
+          cursor: nextCursor,
+          seenTweetIds: Array.from(seenTweetIds),
+          // Include nextCursor in the saved seen-set so resume's loop guard
+          // matches a fresh run's behavior on the next iteration.
+          seenCursors: Array.from(seenCursors).concat([nextCursor]),
+        });
+      }
+
+      if (willStop) break;
       seenCursors.add(nextCursor);
       cursor = nextCursor;
 
-      await new Promise(resolve => setTimeout(resolve, FETCH_DELAY_MS));
+      await sleepCancellable(nextDelay);
     }
 
     if (limit > 0 && allTweets.length > limit) {
       allTweets.length = limit;
     }
-    return { tweets: allTweets, partial: rateLimitRetries > MAX_RATE_LIMIT_RETRIES };
+    return {
+      tweets: allTweets,
+      partial: giveUpFromRateLimit,
+      exhausted: timelineExhausted,
+      paused: userPaused,
+      scanned: seenTweetIds.size,
+    };
   }
 
   function parseTweetsFromResponse(json) {
@@ -574,6 +805,56 @@
     return { tweets, nextCursor };
   }
 
+  // Extract direct media URLs from a tweet's legacy payload.
+  // Photos: pbs.twimg.com/media/<id>.jpg with `?name=orig` for original resolution.
+  // Videos / GIFs: highest-bitrate mp4 variant under video_info.variants.
+  // Both URL forms are paste-into-browser playable and accepted by curl/wget/yt-dlp.
+  // For X video specifically, the tweet's own URL is the most stable input for yt-dlp,
+  // since direct mp4 links carry signed `?tag=` params that may expire.
+  function extractMedia(legacy) {
+    if (!legacy) return [];
+    // `[] || x` returns `[]` because empty arrays are truthy in JS — so a tweet
+    // with `extended_entities.media = []` would silently shadow `entities.media`.
+    // Pick the first non-empty source explicitly.
+    const ext = legacy.extended_entities && legacy.extended_entities.media;
+    const ent = legacy.entities && legacy.entities.media;
+    const list = (ext && ext.length ? ext : null)
+      || (ent && ent.length ? ent : null)
+      || [];
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i];
+      if (!m) continue;
+      if (m.type === 'video' || m.type === 'animated_gif') {
+        const variants = (m.video_info && m.video_info.variants) || [];
+        let best = null;
+        for (let j = 0; j < variants.length; j++) {
+          const v = variants[j];
+          if (!v || v.content_type !== 'video/mp4' || !v.url) continue;
+          if (!best || (v.bitrate || 0) > (best.bitrate || 0)) best = v;
+        }
+        // Leave url empty when no mp4 variant exists (e.g. m3u8-only embeds) —
+        // returning the still-frame URL while tagged 'video' would mislead consumers.
+        // Users can still resolve the video via the tweet's own URL column.
+        out.push({
+          type: m.type === 'animated_gif' ? 'gif' : 'video',
+          url: best ? best.url : '',
+        });
+      } else {
+        // photo (or unknown type — fall back to the still URL).
+        // Preserve any existing query string instead of clobbering it — defensive
+        // against future X CDN format changes.
+        const base = m.media_url_https || '';
+        const sep = base.indexOf('?') >= 0 ? '&' : '?';
+        out.push({
+          type: 'photo',
+          url: base ? base + sep + 'name=orig' : '',
+        });
+      }
+    }
+    return out;
+  }
+
   function parseSingleTweet(tweetResult) {
     try {
       if (tweetResult.__typename === 'TweetTombstone') return null;
@@ -607,6 +888,7 @@
         replies: legacy.reply_count || 0,
         views: views ? parseInt(views, 10) : 0,
         bookmarks: legacy.bookmark_count || 0,
+        media: extractMedia(legacy),
         url: authorScreenName
           ? 'https://x.com/' + authorScreenName + '/status/' + (legacy.id_str || tweet.rest_id)
           : '',
@@ -620,10 +902,18 @@
   // CSV / JSON generation
   // =========================================================================
   function generateCSV(tweets) {
-    const headers = ['date', 'text', 'likes', 'retweets', 'replies', 'views', 'bookmarks', 'url'];
+    // Append media columns AFTER `url` so existing column indices (1–8) stay stable
+    // for any scripts parsing prior exports.
+    const headers = ['date', 'text', 'likes', 'retweets', 'replies', 'views', 'bookmarks', 'url', 'media_count', 'media_urls'];
     const rows = [headers.join(',')];
 
     for (const t of tweets) {
+      const media = Array.isArray(t.media) ? t.media : [];
+      // Pipe-separated to avoid clashing with CSV commas. Each URL is a direct link
+      // (pbs.twimg.com for photos, video.twimg.com mp4 for video/gif) — paste-into-browser
+      // and curl/wget/yt-dlp friendly. For videos, the tweet's `url` column is the most
+      // stable input for yt-dlp since direct mp4 links carry signed params that may expire.
+      const mediaUrls = media.map((m) => m && m.url ? m.url : '').filter(Boolean).join('|');
       const row = [
         csvEscape(formatDate(t.date)),
         csvEscape(t.text),
@@ -633,6 +923,8 @@
         t.views,
         t.bookmarks,
         csvEscape(t.url),
+        media.length,
+        csvEscape(mediaUrls),
       ];
       rows.push(row.join(','));
     }
@@ -665,6 +957,7 @@
       replies: t.replies,
       views: t.views,
       bookmarks: t.bookmarks,
+      media: Array.isArray(t.media) ? t.media : [],
       url: t.url,
     }));
     return JSON.stringify(cleaned, null, 2);
@@ -678,6 +971,8 @@
 
     const format = (payload && payload.format) || 'csv';
     const maxTweets = (payload && payload.maxTweets) || DEFAULT_MAX_TWEETS;
+    const minViews = (payload && payload.minViews) || 0;
+    const resume = payload && payload.resume;
 
     // Try all fallbacks before checking readiness
     updateButtonState('progress', 'Preparing...');
@@ -697,21 +992,60 @@
       sendToBridge('EXPORT_ERROR', { error: 'NO_USER_ID' });
       return;
     }
+    // Capture screenName locally so a profile switch mid-export doesn't poison
+    // the saved snapshot's tag or the final download filename.
+    const screenName = state.profile.screenName || 'unknown';
 
     state.exporting = true;
+    state.pauseRequested = false;
     sendToBridge('EXPORT_STARTED', {});
 
+    const fetchOptions = {
+      minViews: minViews,
+      onPageDone: (snapshot) => {
+        saveProgress(userId, {
+          screenName: screenName,
+          format: format,
+          maxTweets: maxTweets,
+          minViews: minViews,
+          tweets: snapshot.tweets,
+          cursor: snapshot.cursor,
+          seenTweetIds: snapshot.seenTweetIds,
+          seenCursors: snapshot.seenCursors,
+          timestamp: Date.now(),
+        });
+      },
+    };
+
+    if (resume && resume.tweets) {
+      fetchOptions.resumeTweets = resume.tweets;
+      fetchOptions.resumeCursor = resume.cursor;
+      fetchOptions.resumeSeenTweetIds = resume.seenTweetIds;
+      fetchOptions.resumeSeenCursors = resume.seenCursors;
+    }
+
     try {
-      const result = await fetchAllTweets(userId, (count, pages, statusMsg) => {
-        sendToBridge('EXPORT_PROGRESS', { count, pages, statusMsg });
-      }, maxTweets);
+      const result = await fetchAllTweets(userId, (count, pages, statusMsg, rlInfo, scanned) => {
+        sendToBridge('EXPORT_PROGRESS', { count, pages, statusMsg, rlInfo, scanned });
+      }, maxTweets, fetchOptions);
       const tweets = result.tweets;
       const isPartial = result.partial;
+      const isExhausted = result.exhausted;
+      const isPaused = result.paused;
+      const scannedTotal = result.scanned;
 
       if (tweets.length === 0) {
-        sendToBridge('EXPORT_ERROR', { error: 'NO_TWEETS' });
+        await clearProgress(userId);
+        sendToBridge('EXPORT_ERROR', { error: isPaused ? 'PAUSED_EMPTY' : 'NO_TWEETS' });
         state.exporting = false;
         return;
+      }
+
+      // Keep saved progress when the run was incomplete (rate-limited or user-paused),
+      // so the user can resume. Clear it on a clean finish (or on exhausted, since
+      // there's nothing more to fetch).
+      if (!isPartial && !isPaused) {
+        await clearProgress(userId);
       }
 
       let content, mimeType, ext;
@@ -727,16 +1061,19 @@
 
       const blob = new Blob([content], { type: mimeType });
       const blobUrl = URL.createObjectURL(blob);
-      const screenName = state.profile.screenName || 'unknown';
       const dateStr = new Date().toISOString().slice(0, 10);
-      const partialTag = isPartial ? '_partial' : '';
-      const filename = '@' + screenName + '_tweets' + partialTag + '_' + dateStr + '.' + ext;
+      const tag = isPaused ? '_paused' : (isPartial ? '_partial' : (isExhausted ? '_exhausted' : ''));
+      const filename = '@' + screenName + '_tweets' + tag + '_' + dateStr + '.' + ext;
 
       sendToBridge('EXPORT_DOWNLOAD', {
         url: blobUrl,
         filename: filename,
         tweetCount: tweets.length,
         partial: isPartial,
+        exhausted: isExhausted,
+        paused: isPaused,
+        scanned: scannedTotal,
+        minViews: minViews,
       });
 
       // Revoke Blob URL after a delay to allow download to start
@@ -778,33 +1115,64 @@
     return !!getScreenNameFromURL();
   }
 
+  function makeSliderRow(labelText, id, min, max, step, defaultVal, formatValue) {
+    const row = document.createElement('div');
+    row.className = 'x-tweet-export-slider-row';
+
+    const label = document.createElement('span');
+    label.className = 'x-tweet-export-slider-label';
+    label.textContent = labelText;
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.id = id;
+    slider.className = 'x-tweet-export-slider';
+    slider.min = String(min);
+    slider.max = String(max);
+    slider.step = String(step);
+    slider.value = String(defaultVal);
+
+    const valueDisplay = document.createElement('span');
+    valueDisplay.className = 'x-tweet-export-slider-value';
+
+    function refresh() {
+      valueDisplay.textContent = formatValue(parseInt(slider.value, 10));
+    }
+    slider.addEventListener('input', refresh);
+    refresh();
+
+    row.appendChild(label);
+    row.appendChild(slider);
+    row.appendChild(valueDisplay);
+    return { row, slider, refresh };
+  }
+
   function createExportButton() {
     if (document.getElementById(CONTAINER_ID)) return;
 
     const container = document.createElement('div');
     container.id = CONTAINER_ID;
 
-    const wrapper = document.createElement('div');
-    wrapper.className = 'x-tweet-export-wrapper';
+    // Count slider — 50 to 3000 tweets, step 50
+    const countCtl = makeSliderRow(
+      'Count',
+      'x-tweet-export-count',
+      50, 3000, 50, 100,
+      (v) => v + ' tweets'
+    );
 
-    // Count selector
-    const countSelect = document.createElement('select');
-    countSelect.id = 'x-tweet-export-count';
-    countSelect.className = 'x-tweet-export-select';
-    var countOptions = [
-      { value: '50', label: '50' },
-      { value: '100', label: '100' },
-      { value: '200', label: '200' },
-    ];
-    for (var ci = 0; ci < countOptions.length; ci++) {
-      var opt = document.createElement('option');
-      opt.value = countOptions[ci].value;
-      opt.textContent = countOptions[ci].label;
-      if (countOptions[ci].value === '100') opt.selected = true;
-      countSelect.appendChild(opt);
-    }
+    // Min-views slider — 0 disables filtering
+    const minViewsCtl = makeSliderRow(
+      'Min views',
+      'x-tweet-export-min-views',
+      0, 3000, 100, 0,
+      (v) => v === 0 ? 'any' : '≥ ' + v.toLocaleString()
+    );
 
-    // Format selector
+    // Format + Export button row
+    const actionRow = document.createElement('div');
+    actionRow.className = 'x-tweet-export-wrapper';
+
     const formatSelect = document.createElement('select');
     formatSelect.id = 'x-tweet-export-format';
     formatSelect.className = 'x-tweet-export-select';
@@ -829,16 +1197,86 @@
     btn.appendChild(iconSpan);
     btn.appendChild(labelSpan);
 
-    wrapper.appendChild(countSelect);
-    wrapper.appendChild(formatSelect);
-    wrapper.appendChild(btn);
-    container.appendChild(wrapper);
+    actionRow.appendChild(formatSelect);
+    actionRow.appendChild(btn);
 
-    btn.addEventListener('click', () => {
-      if (state.exporting) return;
+    container.appendChild(countCtl.row);
+    container.appendChild(minViewsCtl.row);
+    container.appendChild(actionRow);
+
+    // Warning shown when count or filtering raises rate-limit / completion risk
+    const warning = document.createElement('div');
+    warning.id = 'x-tweet-export-warning';
+    warning.className = 'x-tweet-export-warning';
+    warning.style.display = 'none';
+    container.appendChild(warning);
+
+    function refreshWarning() {
+      const count = parseInt(countCtl.slider.value, 10);
+      const minViews = parseInt(minViewsCtl.slider.value, 10);
+      if (minViews > 0) {
+        // With filtering on, true scan depth is unbounded up to X's ~3200 ceiling
+        warning.textContent = 'Filtering by views — may scan up to 3000 tweets to fill quota; result count may fall short if not enough match';
+        warning.style.display = 'block';
+      } else if (count > 1000) {
+        warning.textContent = 'Very high count — likely needs multiple sessions; resume will pick up where it stops';
+        warning.style.display = 'block';
+      } else if (count > 200) {
+        warning.textContent = 'High count — may take 5+ min, rate limit risk';
+        warning.style.display = 'block';
+      } else {
+        warning.style.display = 'none';
+      }
+    }
+    countCtl.slider.addEventListener('input', refreshWarning);
+    minViewsCtl.slider.addEventListener('input', refreshWarning);
+    refreshWarning();
+
+    btn.addEventListener('click', async () => {
+      // Mid-export click = pause request. fetchAllTweets polls state.pauseRequested
+      // between pages and inside cancellable sleeps, then returns whatever it has
+      // collected. No async work here — must respond instantly to the click.
+      if (state.exporting) {
+        if (state.pauseRequested) return; // already pausing
+        state.pauseRequested = true;
+        updateButtonState('progress', '⏹ Stopping…');
+        return;
+      }
+
       const format = formatSelect.value;
-      const maxTweets = parseInt(countSelect.value, 10);
-      sendToBridge('TRIGGER_EXPORT_FROM_UI', { format, maxTweets });
+      const maxTweets = parseInt(countCtl.slider.value, 10);
+      const minViews = parseInt(minViewsCtl.slider.value, 10);
+      const userId = state.profile.userId;
+
+      // Check for resumable progress on this user before starting fresh
+      let resume = null;
+      if (userId) {
+        const saved = await loadProgress(userId).catch(() => null);
+        if (saved && Array.isArray(saved.tweets) && saved.tweets.length > 0) {
+          const ageMin = Math.round((Date.now() - saved.timestamp) / 60000);
+          const savedMinViews = typeof saved.minViews === 'number' ? saved.minViews : 0;
+          const filterMismatch = savedMinViews !== minViews;
+          let msg = 'Found unfinished export: ' + saved.tweets.length + ' tweets fetched ' + ageMin + ' min ago.\n';
+          if (filterMismatch) {
+            msg += '\nNote: saved snapshot used min-views = ' + savedMinViews + ', current setting is ' + minViews + '.\n';
+            if (minViews > savedMinViews) {
+              // Tightening: re-filter narrows further — recoverable, just narrows.
+              msg += 'Resuming will re-filter saved tweets with the stricter min-views and apply it to subsequent pages.\n';
+            } else {
+              // Loosening: previously-filtered-out tweets cannot be recovered (seenTweetIds blocks re-fetch).
+              msg += 'WARNING: tweets that did not match the previous min-views (' + savedMinViews + ') were not saved and CANNOT be recovered by resuming. New pages will use the looser filter, but historical low-views tweets are lost.\nIf you want all of them, click Cancel and start over.\n';
+            }
+          }
+          msg += '\nOK = Resume from where it stopped\nCancel = Start over (discard saved progress)';
+          if (window.confirm(msg)) {
+            resume = saved;
+          } else {
+            await clearProgress(userId).catch(() => {});
+          }
+        }
+      }
+
+      sendToBridge('TRIGGER_EXPORT_FROM_UI', { format, maxTweets, minViews, resume });
     });
 
     injectButton(container);
@@ -893,23 +1331,37 @@
       case 'ready':
         label.textContent = 'Export Tweets';
         btn.disabled = false;
+        btn.title = '';
         btn.classList.remove('x-tweet-export-error', 'x-tweet-export-progress', 'x-tweet-export-done');
         break;
       case 'progress':
-        label.textContent = message || 'Exporting...';
-        btn.disabled = true;
+        // Once pauseRequested is set, lock the label to the Stopping message so
+        // late-arriving progress events from the in-flight fetch don't overwrite it.
+        // Otherwise, append a stop-hint glyph so the user knows the button stays clickable.
+        var msg;
+        if (state.pauseRequested) {
+          msg = '⏹ Stopping…';
+        } else {
+          msg = message || 'Exporting...';
+          if (msg.indexOf('⏹') === -1) msg += ' ⏹';
+        }
+        label.textContent = msg;
+        btn.disabled = false;
+        btn.title = state.pauseRequested ? 'Stopping…' : 'Click to stop and save what was fetched';
         btn.classList.add('x-tweet-export-progress');
         btn.classList.remove('x-tweet-export-error', 'x-tweet-export-done');
         break;
       case 'done':
         label.textContent = message || 'Done!';
         btn.disabled = false;
+        btn.title = '';
         btn.classList.add('x-tweet-export-done');
         btn.classList.remove('x-tweet-export-error', 'x-tweet-export-progress');
         break;
       case 'error':
         label.textContent = message || 'Error';
         btn.disabled = false;
+        btn.title = '';
         btn.classList.add('x-tweet-export-error');
         btn.classList.remove('x-tweet-export-progress', 'x-tweet-export-done');
         break;
@@ -981,13 +1433,30 @@
       case 'EXPORT_STARTED':
         updateButtonState('progress', 'Exporting...');
         break;
-      case 'EXPORT_PROGRESS':
-        updateButtonState('progress', payload.statusMsg || ('Exporting... ' + payload.count + ' tweets fetched'));
+      case 'EXPORT_PROGRESS': {
+        const rlSuffix = payload.rlInfo || '';
+        // Show "scanned X" only when filtering is active and scan > collected (otherwise it's noise)
+        const scannedSuffix = (typeof payload.scanned === 'number' && payload.scanned > payload.count)
+          ? ' (scanned ' + payload.scanned + ')'
+          : '';
+        const msg = payload.statusMsg || ('Exporting... ' + payload.count + ' tweets' + scannedSuffix + rlSuffix);
+        updateButtonState('progress', msg);
         break;
+      }
       case 'EXPORT_DOWNLOAD': {
-        var doneMsg = payload.partial
-          ? 'Partial: ' + payload.tweetCount + ' tweets (rate limited)'
-          : 'Done! ' + payload.tweetCount + ' tweets exported';
+        var doneMsg;
+        if (payload.paused) {
+          doneMsg = 'Stopped: ' + payload.tweetCount + ' tweets saved (resumable)';
+        } else if (payload.partial) {
+          doneMsg = 'Partial: ' + payload.tweetCount + ' tweets (rate limited)';
+        } else if (payload.exhausted) {
+          // Hit X's ~3200 timeline ceiling without filling the requested quota
+          doneMsg = 'Done: ' + payload.tweetCount + ' tweets (timeline exhausted'
+            + (payload.minViews > 0 ? ', scanned ' + payload.scanned : '')
+            + ')';
+        } else {
+          doneMsg = 'Done! ' + payload.tweetCount + ' tweets exported';
+        }
         updateButtonState('done', doneMsg);
         setTimeout(() => updateButtonState('ready'), 5000);
         break;
@@ -1003,6 +1472,7 @@
           NETWORK_ERROR: 'Network error \u2014 check your connection',
           NO_TWEETS: 'No tweets found for this user',
           PARSE_ERROR: 'Failed to parse response',
+          PAUSED_EMPTY: 'Stopped before any tweet was fetched',
         };
         const msg = errorMessages[payload.error] || ('Error: ' + payload.error);
         updateButtonState('error', msg);
