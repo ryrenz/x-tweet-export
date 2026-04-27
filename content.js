@@ -1091,6 +1091,21 @@
   const BUTTON_ID = 'x-tweet-export-btn';
   const CONTAINER_ID = 'x-tweet-export-container';
 
+  // Min-views slider snap points. Linear 0-1M would make 1k-10k almost unreachable
+  // (occupies ~1% of the slider width), so we expose a curated ladder instead —
+  // index in [0, length-1] maps to a threshold below.
+  const VIEW_THRESHOLDS = [
+    0, 500, 1000, 2000, 5000, 10000,
+    25000, 50000, 100000, 250000, 500000, 1000000,
+  ];
+
+  function formatViewsLabel(n) {
+    if (!n) return '';
+    if (n >= 1000000) return (n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + 'k';
+    return String(n);
+  }
+
   const PROFILE_SUB_ROUTES = new Set([
     '', 'with_replies', 'media', 'likes', 'highlights', 'articles',
   ]);
@@ -1161,12 +1176,17 @@
       (v) => v + ' tweets'
     );
 
-    // Min-views slider — 0 disables filtering
+    // Min-views slider — slider value is an INDEX into VIEW_THRESHOLDS, not the
+    // raw views number. Lets us cover 0 → 1M with sane snap points instead of a
+    // linear range where 1k-10k would be unreachably small (~1% of slider width).
     const minViewsCtl = makeSliderRow(
       'Min views',
       'x-tweet-export-min-views',
-      0, 3000, 100, 0,
-      (v) => v === 0 ? 'any' : '≥ ' + v.toLocaleString()
+      0, VIEW_THRESHOLDS.length - 1, 1, 0,
+      (idx) => {
+        const v = VIEW_THRESHOLDS[idx] || 0;
+        return v === 0 ? 'any' : '≥ ' + formatViewsLabel(v);
+      }
     );
 
     // Format + Export button row
@@ -1213,7 +1233,8 @@
 
     function refreshWarning() {
       const count = parseInt(countCtl.slider.value, 10);
-      const minViews = parseInt(minViewsCtl.slider.value, 10);
+      const idx = parseInt(minViewsCtl.slider.value, 10);
+      const minViews = VIEW_THRESHOLDS[idx] || 0;
       if (minViews > 0) {
         // With filtering on, true scan depth is unbounded up to X's ~3200 ceiling
         warning.textContent = 'Filtering by views — may scan up to 3000 tweets to fill quota; result count may fall short if not enough match';
@@ -1245,7 +1266,8 @@
 
       const format = formatSelect.value;
       const maxTweets = parseInt(countCtl.slider.value, 10);
-      const minViews = parseInt(minViewsCtl.slider.value, 10);
+      const minViewsIdx = parseInt(minViewsCtl.slider.value, 10);
+      const minViews = VIEW_THRESHOLDS[minViewsIdx] || 0;
       const userId = state.profile.userId;
 
       // Check for resumable progress on this user before starting fresh
@@ -1258,13 +1280,15 @@
           const filterMismatch = savedMinViews !== minViews;
           let msg = 'Found unfinished export: ' + saved.tweets.length + ' tweets fetched ' + ageMin + ' min ago.\n';
           if (filterMismatch) {
-            msg += '\nNote: saved snapshot used min-views = ' + savedMinViews + ', current setting is ' + minViews + '.\n';
+            const savedLabel = savedMinViews ? formatViewsLabel(savedMinViews) : 'any';
+            const currentLabel = minViews ? formatViewsLabel(minViews) : 'any';
+            msg += '\nNote: saved snapshot used min-views = ' + savedLabel + ', current setting is ' + currentLabel + '.\n';
             if (minViews > savedMinViews) {
               // Tightening: re-filter narrows further — recoverable, just narrows.
               msg += 'Resuming will re-filter saved tweets with the stricter min-views and apply it to subsequent pages.\n';
             } else {
               // Loosening: previously-filtered-out tweets cannot be recovered (seenTweetIds blocks re-fetch).
-              msg += 'WARNING: tweets that did not match the previous min-views (' + savedMinViews + ') were not saved and CANNOT be recovered by resuming. New pages will use the looser filter, but historical low-views tweets are lost.\nIf you want all of them, click Cancel and start over.\n';
+              msg += 'WARNING: tweets that did not match the previous min-views (' + savedLabel + ') were not saved and CANNOT be recovered by resuming. New pages will use the looser filter, but historical low-views tweets are lost.\nIf you want all of them, click Cancel and start over.\n';
             }
           }
           msg += '\nOK = Resume from where it stopped\nCancel = Start over (discard saved progress)';
