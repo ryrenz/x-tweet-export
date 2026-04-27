@@ -653,7 +653,8 @@
         const wait = computeBackoffDelay(rateLimitRetries);
         rateLimitRetries++;
         if (onProgress) {
-          onProgress(allTweets.length, pageCount, 'Rate limited, waiting ' + Math.round(wait / 1000) + 's (retry ' + rateLimitRetries + '/' + MAX_RATE_LIMIT_RETRIES + ')...');
+          // Short form to fit the button width — full retry info is logged via title attr
+          onProgress(allTweets.length, pageCount, 'Wait ' + Math.round(wait / 1000) + 's');
         }
         await sleepCancellable(wait);
         continue;
@@ -1026,7 +1027,7 @@
 
     try {
       const result = await fetchAllTweets(userId, (count, pages, statusMsg, rlInfo, scanned) => {
-        sendToBridge('EXPORT_PROGRESS', { count, pages, statusMsg, rlInfo, scanned });
+        sendToBridge('EXPORT_PROGRESS', { count, pages, statusMsg, rlInfo, scanned, quota: maxTweets });
       }, maxTweets, fetchOptions);
       const tweets = result.tweets;
       const isPartial = result.partial;
@@ -1458,13 +1459,26 @@
         updateButtonState('progress', 'Exporting...');
         break;
       case 'EXPORT_PROGRESS': {
-        const rlSuffix = payload.rlInfo || '';
-        // Show "scanned X" only when filtering is active and scan > collected (otherwise it's noise)
-        const scannedSuffix = (typeof payload.scanned === 'number' && payload.scanned > payload.count)
-          ? ' (scanned ' + payload.scanned + ')'
-          : '';
-        const msg = payload.statusMsg || ('Exporting... ' + payload.count + ' tweets' + scannedSuffix + rlSuffix);
-        updateButtonState('progress', msg);
+        // Compact label: "23/100" so it fits the narrow sidebar button. Full context
+        // (scanned depth, rate-limit headroom) lives in the hover tooltip instead.
+        const compact = payload.statusMsg || (payload.count + '/' + (payload.quota || '?'));
+        updateButtonState('progress', compact);
+
+        // Tooltip carries the verbose info that no longer fits in the label
+        const btn = document.getElementById(BUTTON_ID);
+        if (btn && !state.pauseRequested) {
+          let detail = 'Click to stop and save what was fetched';
+          const parts = [];
+          if (typeof payload.scanned === 'number' && payload.scanned > payload.count) {
+            parts.push('scanned ' + payload.scanned);
+          }
+          if (payload.rlInfo) {
+            // rlInfo looks like " [50/150]" — trim leading space + brackets for tooltip
+            parts.push('rate ' + payload.rlInfo.replace(/^\s*\[|\]$/g, ''));
+          }
+          if (parts.length) detail += ' (' + parts.join(', ') + ')';
+          btn.title = detail;
+        }
         break;
       }
       case 'EXPORT_DOWNLOAD': {
